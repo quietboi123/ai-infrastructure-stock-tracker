@@ -226,4 +226,183 @@ def load_history(tickers, days):
         raw = raw.to_frame(name="Close")
     # If single-index columns
     if not isinstance(raw.columns, pd.MultiIndex):
-        closes = raw["Close"].to_frame() if "Close" in raw.columns else raw.iloc[:, [0]]()_
+        closes = raw["Close"].to_frame() if "Close" in raw.columns else raw.iloc[:, [0]].copy()
+        if len(tickers) == 1:
+            closes.columns = [list(tickers)[0]]
+        return closes.dropna(how="all")
+    # MultiIndex: pick Close level
+    lvl0 = set(raw.columns.get_level_values(0))
+    close_key = "Close" if "Close" in lvl0 else ("Adj Close" if "Adj Close" in lvl0 else list(lvl0)[0])
+    closes = raw[close_key].copy()
+    if isinstance(closes.columns, pd.MultiIndex):
+        closes.columns = [c[1] for c in closes.columns]
+    keep = [t for t in tickers if t in closes.columns]
+    return closes[keep].dropna(how="all")
+
+hist_tickers = set(all_tickers) | set(bench.keys())
+px_hist = load_history(hist_tickers, lookback_days)
+
+def compute_nav_with_events(px: pd.DataFrame, ret_weights_events: list, tickers_for_weights: list):
+    """
+    px: price history (columns = tickers)
+    ret_weights_events: list of {"date": datetime.date, "weights": dict}, sorted by date
+    tickers_for_weights: the tickers we consider for weights (e.g., holdings tickers)
+    Returns a NAV series starting at 1.0, using piecewise-constant weights across event segments.
+    """
+    if px.empty:
+        return pd.Series(dtype=float)
+
+    # Daily returns
+    ret = px.pct_change().fillna(0.0)
+
+    # Build a weights schedule over the index
+    idx = ret.index
+    # If no events, treat as single event at the first date
+    events = sorted(ret_weights_events, key=lambda e: e["date"]) if ret_weights_events else []
+    if not events:
+        events = [{"date": idx[0].date(), "weights": _normalize_weights({k: DEFAULT_WEIGHTS.get(k, 0) for k in tickers_for_weights})}]
+    # Filter events within the index range; ensure one at/ before start
+    start_date = idx[0].date()
+    events_in = [e for e in events if e["date"] <= idx[-1].date()]
+    if not any(e["date"] <= start_date for e in events_in):
+        # Prepend a start event using the earliest available event's weights
+        base_w = events_in[0]["weights"] if events_in else _normalize_weights({k: DEFAULT_WEIGHTS.get(k, 0) for k in tickers_for_weights})
+        events_in = [{"date": start_date, "weights": base_w}] + events_in
+    # Collapse duplicate dates by keeping the last on that day
+    dedup = {}
+    for e in events_in:
+        dedup[e["date"]] = e["weights"]
+    events_sorted = [{"date": d, "weights": dedup[d]} for d in sorted(dedup.keys())]
+
+    # Create a DataFrame of weights aligned to index
+    wdf = pd.DataFrame(0.0, index=idx, columns=px.columns)
+    current_w = None
+    event_ptr = 0
+    for ts in idx:
+        d = ts.date()
+        # Advance event pointer if next event date has arrived
+        while event_ptr < len(events_sorted) and events_sorted[event_ptr]["date"] <= d:
+            # Normalize and store only tickers present in px
+            ww = {t: events_sorted[event_ptr]["weights"].get(t, 0.0) for t in px.columns}
+            current_w = _normalize_weights(ww)
+            event_ptr += 1
+        if current_w is None:
+            # Before first event on index; use zeros
+            continue
+        for t, w in current_w.items():
+            if t in wdf.columns:
+                wdf.at[ts, t] = w
+
+    # Compute weighted daily returns
+    port_ret = (ret * wdf).sum(axis=1)
+    nav = (1 + port_ret).cumprod()
+    return nav
+
+if not px_hist.empty:
+    # Subset columns for portfolio and for benchmark
+    port_cols = [t for t in weights.keys() if t in px_hist.columns]
+    bench_cols = [t for t in bench.keys() if t in px_hist.columns]
+
+    # Build events list for portfolio performance using current session events
+    events_for_perf = st.session_state.rebalance_events.copy()
+    # If you want the *current* target weights to apply from today onward (even if not added as event),
+    # you can append a "today" event implicitly:
+    # events_for_perf.append({"date": date.today(), "weights": _normalize_weights(weights)})
+
+    # Compute NAVs
+    port_nav = compute_nav_with_events(px_hist[port_cols], events_for_perf, port_cols)
+    # Benchmark NAV uses constant weights (no re-weight events)
+    bench_w_series = pd.Series(bench)
+    if not bench_w_series.empty:
+        bench_w_series = bench_w_series.loc[bench_cols] / bench_w_series.loc[bench_cols].sum() if bench_cols else bench_w_series
+    ret = px_hist[bench_cols].pct_change().fillna(0.0)
+    bench_nav = (1 + (ret * bench_w_series).sum(axis=1)).cumprod() if not bench_w_series.empty else pd.Series(index=ret.index, data=1.0)
+
+    st.subheader("Performance")
+    st.caption(f"Benchmark: {_bench_label(bench)}")
+    colA, colB = st.columns(2)
+    if not port_nav.empty:
+        colA.metric("Portfolio return", f"{(port_nav.iloc[-1]-1):.2%}")
+    if not bench_nav.empty:
+        colB.metric("Benchmark return", f"{(bench_nav.iloc[-1]-1):.2%}", delta=f"{(port_nav.iloc[-1]-bench_nav.iloc[-1]):+.2%}")
+
+    # Align for chart
+    chart_df = pd.DataFrame({"Portfolio": port_nav, "Benchmark": bench_nav}).dropna(how="all")
+    st.line_chart(chart_df)
+else:
+    st.info("Price history not available yet. Try a shorter lookback or check symbols.")
+
+# -----------------------------
+# Rebalancing Engine (trade ideas)
+# -----------------------------
+st.subheader("🔁 Rebalance Suggestions")
+
+# Target values and trades
+target_values = {t: portfolio_value * weights[t] for t in all_tickers}
+current_values = {t: float(val_df.loc[t, "Value"]) for t in all_tickers}
+
+trade_rows = []
+new_cash = cash
+for t in all_tickers:
+    px = prices[t]
+    cur = current_values[t]
+    tgt = target_values[t]
+    delta = tgt - cur
+    drift = float(val_df.loc[t, "DriftPct"]) if t in val_df.index else 0.0
+
+    action = "HOLD"
+    shares = 0.0
+    notional = 0.0
+
+    # Only trade if drift exceeds tolerance and trade meets min size
+    if abs(drift) >= rebalance_tol and abs(delta) >= min_trade_usd and px and not np.isnan(px):
+        shares = round(delta / px, int(fractional_round))
+        if shares != 0:
+            notional = shares * px
+            action = "BUY" if shares > 0 else "SELL"
+            new_cash -= notional
+
+    trade_rows.append({
+        "Ticker": t,
+        "Action": action,
+        "Shares": shares,
+        "Price": px,
+        "Notional": notional,
+        "Current $": cur,
+        "Target $": tgt,
+        "Drift %": drift,
+    })
+
+trades_df = pd.DataFrame(trade_rows).set_index("Ticker")
+
+st.dataframe(trades_df[["Action", "Shares", "Price", "Notional", "Current $", "Target $", "Drift %"]].style.format({
+    "Shares": "{:.6f}",
+    "Price": "${:,.2f}",
+    "Notional": "${:,.2f}",
+    "Current $": "${:,.2f}",
+    "Target $": "${:,.2f}",
+    "Drift %": "{:+.2f}%",
+}))
+
+# Download trade ticket
+csv_buf = io.StringIO()
+trades_df.reset_index().to_csv(csv_buf, index=False)
+st.download_button("📥 Download trade ticket (CSV)", data=csv_buf.getvalue(), file_name=f"rebalance_trades_{datetime.now().date()}.csv", mime="text/csv")
+
+# Cash after proposed trades
+st.metric("Projected cash after trades", f"${new_cash:,.2f}")
+
+# -----------------------------
+# Notes
+# -----------------------------
+st.info(
+    """
+    **Notes**
+    - This tool does not connect to your broker. Enter your current shares and cash manually.
+    - Prices come from Yahoo Finance via `yfinance` and can differ slightly from Robinhood.
+    - Re-weight events: add one whenever you actually rebalance; performance will respect those dates.
+    - Use fractional shares on Robinhood to match suggested quantities (or round as you prefer).
+    - Rebalance tolerance avoids churning small trades. Increase it if you prefer fewer trades.
+    """
+)
+st.caption("Built by ChatGPT. Educational use only; not investment advice.")
